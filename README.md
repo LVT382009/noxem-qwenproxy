@@ -62,7 +62,7 @@ graph TD
 ```bash
 # Clonar repositório
 git clone https://github.com/LVT382009/noxem-qwenproxy.git
-cd qwenproxy
+cd noxem-qwenproxy
 
 # Instalar dependências
 npm install
