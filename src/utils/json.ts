@@ -109,7 +109,7 @@ export function robustParseJSON(str: string): unknown {
 		if (aggressive.endsWith(",")) aggressive = aggressive.slice(0, -1);
 
 		// Remove any content that looks like HTML/XML tags (from LLM hallucination)
-		aggressive = aggressive.replace(/<[^>]*>/g, "");
+		aggressive = aggressive.replace(/<[a-zA-Z][^>]*>/g, "");
 
 		// Recount for the aggressive version
 		let ob = 0,

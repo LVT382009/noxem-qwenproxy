@@ -3,20 +3,20 @@
  * Project: qwenproxy
  * Author: Pedro Farias
  * Created: 2026-05-09
- * 
+ *
  * Last Modified: Sat May 09 2026
  * Modified By: Pedro Farias
  */
 
-import { Context } from 'hono';
-import { stream as honoStream } from 'hono/streaming';
-import { v4 as uuidv4 } from 'uuid';
-import { createQwenStream, updateSessionParent } from '../services/qwen.ts';
-import { OpenAIRequest, ChoiceDelta, Message } from '../utils/types.ts';
-import { registry } from '../tools/registry.ts';
-import type { FunctionToolDefinition } from '../tools/types.ts';
-import { robustParseJSON } from '../utils/json.ts';
-import { StreamingToolParser } from '../tools/parser.ts';
+import { Context } from "hono";
+import { stream as honoStream } from "hono/streaming";
+import { v4 as uuidv4 } from "uuid";
+import { createQwenStream, updateSessionParent } from "../services/qwen.ts";
+import { OpenAIRequest, ChoiceDelta, Message } from "../utils/types.ts";
+import { registry } from "../tools/registry.ts";
+import type { FunctionToolDefinition } from "../tools/types.ts";
+import { robustParseJSON } from "../utils/json.ts";
+import { StreamingToolParser } from "../tools/parser.ts";
 
 interface DeltaResult {
   delta: string;
@@ -28,14 +28,25 @@ function getIncrementalDelta(oldStr: string, newStr: string): DeltaResult {
     return { delta: newStr, matchedContent: newStr };
   }
   if (newStr === oldStr) {
-    return { delta: '', matchedContent: oldStr };
+    return { delta: "", matchedContent: oldStr };
+  }
+
+  // Fast path: newStr is a pure extension of oldStr
+  if (newStr.startsWith(oldStr)) {
+    return {
+      delta: newStr.substring(oldStr.length),
+      matchedContent: newStr,
+    };
   }
 
   // Heuristic to detect if newStr is cumulative or incremental:
   // If newStr is cumulative, it should share a common prefix with oldStr.
   let commonPrefixLen = 0;
   const maxLen = Math.min(oldStr.length, newStr.length);
-  while (commonPrefixLen < maxLen && oldStr[commonPrefixLen] === newStr[commonPrefixLen]) {
+  while (
+    commonPrefixLen < maxLen &&
+    oldStr[commonPrefixLen] === newStr[commonPrefixLen]
+  ) {
     commonPrefixLen++;
   }
 
@@ -43,29 +54,21 @@ function getIncrementalDelta(oldStr: string, newStr: string): DeltaResult {
   if (commonPrefixLen >= threshold) {
     return {
       delta: newStr.substring(commonPrefixLen),
-      matchedContent: newStr
+      matchedContent: newStr,
     };
   }
 
-  // Fallback: If oldStr is found anywhere in newStr, return the suffix after it
-  const idx = newStr.indexOf(oldStr);
-  if (idx !== -1) {
-    return {
-      delta: newStr.substring(idx + oldStr.length),
-      matchedContent: newStr
-    };
-  }
-
-  // Sliding overlap search: find the longest suffix of oldStr that exists in newStr
+  // Sliding overlap search: find the longest suffix of oldStr that exists in newStr,
+  // but only at the start of newStr to avoid matching in the middle of content.
   const suffixMinLength = Math.min(oldStr.length, 4);
   const suffixMaxSearch = Math.min(oldStr.length, 30);
   for (let i = suffixMaxSearch; i >= suffixMinLength; i--) {
     const suffix = oldStr.slice(-i);
-    const lastIdx = newStr.lastIndexOf(suffix);
-    if (lastIdx !== -1) {
+    const firstIdx = newStr.indexOf(suffix);
+    if (firstIdx !== -1 && firstIdx <= oldStr.length) {
       return {
-        delta: newStr.substring(lastIdx + suffix.length),
-        matchedContent: newStr
+        delta: newStr.substring(firstIdx + suffix.length),
+        matchedContent: newStr,
       };
     }
   }
@@ -73,98 +76,126 @@ function getIncrementalDelta(oldStr: string, newStr: string): DeltaResult {
   // Otherwise, it is strictly incremental (or pure delta):
   return {
     delta: newStr,
-    matchedContent: oldStr + newStr
+    matchedContent: oldStr + newStr,
   };
 }
 
-function parseQwenErrorPayload(raw: string): { message: string; status: number } | null {
-  const text = raw.trim();
-  if (!text || text.startsWith('data: ')) return null;
+function parseQwenErrorPayload(
+  raw: string,
+): { message: string; status: number } | null {
+  let body = raw.trim();
+  if (!body) return null;
+  if (body.startsWith("data: ")) body = body.slice(6);
+  if (!body) return null;
 
   try {
-    const payload = JSON.parse(text);
+    const payload = JSON.parse(body);
     if (payload && payload.success === false) {
-      const code = payload.data?.code || payload.code || 'UpstreamError';
-      const details = payload.data?.details || payload.message || 'Qwen returned an error';
-      const wait = payload.data?.num !== undefined ? ` Wait about ${payload.data.num} hour(s) before trying again.` : '';
-      const status = code === 'RateLimited' ? 429 : 502;
-      return { message: `Qwen upstream error: ${code}: ${details}.${wait}`, status };
+      const code = payload.data?.code || payload.code || "UpstreamError";
+      const details =
+        payload.data?.details || payload.message || "Qwen returned an error";
+      const wait =
+        payload.data?.num !== undefined
+          ? ` Wait about ${payload.data.num} hour(s) before trying again.`
+          : "";
+      const status = code === "RateLimited" ? 429 : 502;
+      return {
+        message: `Qwen upstream error: ${code}: ${details}.${wait}`,
+        status,
+      };
     }
     if (payload && payload.error) {
-      const msg = typeof payload.error === 'string' ? payload.error : (payload.error.message || JSON.stringify(payload.error));
+      const msg =
+        typeof payload.error === "string"
+          ? payload.error
+          : payload.error.message || JSON.stringify(payload.error);
       return { message: `Qwen upstream error: ${msg}`, status: 502 };
     }
   } catch {
     // Non-SSE, non-JSON upstream body. Keep this as an explicit bad gateway
     // instead of silently returning an empty assistant message.
-    return { message: `Qwen upstream returned non-SSE response: ${text.slice(0, 300)}`, status: 502 };
+    return {
+      message: `Qwen upstream returned non-SSE response: ${body.slice(0, 300)}`,
+      status: 502,
+    };
   }
 
   return null;
 }
 
 export async function chatCompletions(c: Context) {
+  let parseErrorLogCount = 0;
   try {
     const body: OpenAIRequest = await c.req.json();
     const isStream = body.stream ?? false;
-    
+
     // Extract the prompt
-    let prompt = '';
+    let prompt = "";
     const messages = body.messages || [];
-    let systemPrompt = '';
-    
+    let systemPrompt = "";
+
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
-      let contentStr = '';
+      let contentStr = "";
       if (Array.isArray(msg.content)) {
-        contentStr = msg.content.map((c: any) => c.text || JSON.stringify(c)).join('\n');
-      } else if (typeof msg.content === 'object' && msg.content !== null) {
+        contentStr = msg.content
+          .map((c: any) => c.text || JSON.stringify(c))
+          .join("\n");
+      } else if (typeof msg.content === "object" && msg.content !== null) {
         contentStr = JSON.stringify(msg.content);
       } else {
-        contentStr = msg.content || '';
+        contentStr = msg.content || "";
       }
 
-      if (msg.role === 'system') {
-        systemPrompt += contentStr + '\n\n';
-      } else if (msg.role === 'user') {
+      if (msg.role === "system") {
+        systemPrompt += contentStr + "\n\n";
+      } else if (msg.role === "user") {
         prompt += `User: ${contentStr}\n\n`;
-      } else if (msg.role === 'assistant') {
+      } else if (msg.role === "assistant") {
         let assistantContent = contentStr;
         if ((msg as any).reasoning_content) {
-          assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
+          assistantContent = ` <think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
         }
         if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-           for (const tc of msg.tool_calls) {
-             let args = tc.function?.arguments || '{}';
-             if (typeof args !== 'string') args = JSON.stringify(args);
-             assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
-           }
+          for (const tc of msg.tool_calls) {
+            let args = tc.function?.arguments || "{}";
+            if (typeof args !== "string") args = JSON.stringify(args);
+            assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
+          }
         }
         prompt += `Assistant: ${assistantContent.trim()}\n\n`;
-      } else if (msg.role === 'tool' || msg.role === 'function') {
-        prompt += `Tool Response (${msg.name || 'tool'}): ${contentStr}\n\n`;
+      } else if (msg.role === "tool" || msg.role === "function") {
+        prompt += `Tool Response (${msg.name || "tool"}): ${contentStr}\n\n`;
       }
     }
 
     // Inject tools instructions
     const bodyAny = body as any;
-    if (bodyAny.tools && Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0) {
+    if (
+      bodyAny.tools &&
+      Array.isArray(bodyAny.tools) &&
+      bodyAny.tools.length > 0
+    ) {
       // Better formatting for tools
       const formattedTools = bodyAny.tools.map((t: any) => {
-        if (t.type === 'function') {
+        if (t.type === "function") {
           return {
             name: t.function.name,
-            description: t.function.description || '',
-            parameters: t.function.parameters
+            description: t.function.description || "",
+            parameters: t.function.parameters,
           };
         }
         return t;
       });
       const toolsJson = JSON.stringify(formattedTools, null, 2);
-      
+
       systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\n# TOOL CALLING FORMAT (MANDATORY)\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nEXAMPLE OF MULTIPLE TOOL CALLS:\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file1.txt"}}\n</tool_call>\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file2.txt"}}\n</tool_call>\n\nCRITICAL RULES:\n1. ONLY use the tags above for tool calling. NEVER output raw JSON without tags.\n2. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n3. Do NOT output any other text (explanations, chat, etc.) after your <tool_call> blocks. Wait for the user to provide the tool response.\n4. The JSON inside the tags MUST be valid and include ALL required braces and the "arguments" field.\n5. If you need to use a tool, do it IMMEDIATELY without preamble.\n\n`;
-      
-      if (bodyAny.tool_choice && typeof bodyAny.tool_choice === 'object' && bodyAny.tool_choice.function) {
+
+      if (
+        bodyAny.tool_choice &&
+        typeof bodyAny.tool_choice === "object" &&
+        bodyAny.tool_choice.function
+      ) {
         const forcedTool = bodyAny.tool_choice.function.name;
         systemPrompt += `CRITICAL: You MUST call the tool "${forcedTool}" in this response.\n\n`;
       }
@@ -172,20 +203,27 @@ export async function chatCompletions(c: Context) {
 
     const finalPrompt = systemPrompt ? `${systemPrompt}\n${prompt}` : prompt;
 
-    const isThinkingModel = !body.model.includes('no-thinking');
-    
-    // A session is new if it doesn't have any assistant messages yet.
-    // This handles cases where the first request has [System, User] messages.
-    const isNewSession = !messages.some(m => m.role === 'assistant');
+    const isThinkingModel = !body.model.includes("no-thinking");
+
+    // A session is new if it doesn't have any assistant, tool, or function messages yet.
+    const isNewSession = !messages.some(
+      (m) =>
+        m.role === "assistant" || m.role === "tool" || m.role === "function",
+    );
 
     // Empty response retry logic
     let stream: ReadableStream;
-    let uiSessionId = '';
+    let uiSessionId = "";
     let retries = 3;
     while (retries > 0) {
       try {
         // If it's a new session, force parent_message_id to null
-        const result = await createQwenStream(finalPrompt, isThinkingModel, body.model, isNewSession ? null : undefined);
+        const result = await createQwenStream(
+          finalPrompt,
+          isThinkingModel,
+          body.model,
+          isNewSession ? null : undefined,
+        );
         stream = result.stream;
         uiSessionId = result.uiSessionId;
         break; // Success
@@ -193,22 +231,23 @@ export async function chatCompletions(c: Context) {
         retries--;
         if (retries === 0) throw err;
         // Wait a bit before retrying
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise((r) => setTimeout(r, 1000));
       }
     }
 
-    const completionId = 'chatcmpl-' + uuidv4();
+    const completionId = "chatcmpl-" + uuidv4();
 
     if (!isStream) {
       const reader = stream!.getReader();
       const decoder = new TextDecoder();
 
       let currentThoughtIndex = 0;
-      let reasoningBuffer = '';
-      let lastFullContent = '';
+      let reasoningBuffer = "";
+      let lastFullContent = "";
+      let lastToolParsedText = "";
       const toolParser = new StreamingToolParser();
       const toolCallsOut: any[] = [];
-      let buffer = '';
+      let buffer = "";
       let completionTokens = 0;
       let promptTokens = Math.ceil(finalPrompt.length / 3.5);
       while (true) {
@@ -216,52 +255,67 @@ export async function chatCompletions(c: Context) {
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
 
         for (const line of lines) {
           const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          if (!trimmed || !trimmed.startsWith("data: ")) continue;
 
           const dataStr = trimmed.slice(6);
-          if (dataStr === '[DONE]') continue;
+          if (dataStr === "[DONE]") continue;
 
           try {
             const chunk = JSON.parse(dataStr);
 
-            if (chunk['response.created'] && chunk['response.created'].response_id) {
-              updateSessionParent(uiSessionId, chunk['response.created'].response_id);
+            if (
+              chunk["response.created"] &&
+              chunk["response.created"].response_id
+            ) {
+              updateSessionParent(
+                uiSessionId,
+                chunk["response.created"].response_id,
+              );
             } else if (chunk.response_id) {
               updateSessionParent(uiSessionId, chunk.response_id);
             }
 
             if (chunk.usage) {
-              if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
-              if (chunk.usage.input_tokens) promptTokens = chunk.usage.input_tokens;
+              if (chunk.usage.output_tokens)
+                completionTokens = chunk.usage.output_tokens;
+              if (chunk.usage.input_tokens)
+                promptTokens = chunk.usage.input_tokens;
             }
 
-            let vStr = '';
+            let vStr = "";
             let foundStr = false;
             let isThinkingChunk = false;
 
             if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
               const delta = chunk.choices[0].delta;
 
-              if (delta.phase === 'thinking_summary') {
+              if (delta.phase === "thinking_summary") {
                 isThinkingChunk = true;
-                if (delta.extra && delta.extra.summary_thought && delta.extra.summary_thought.content) {
+                if (
+                  delta.extra &&
+                  delta.extra.summary_thought &&
+                  delta.extra.summary_thought.content
+                ) {
                   const thoughts = delta.extra.summary_thought.content;
                   if (thoughts.length > currentThoughtIndex) {
-                    vStr = thoughts.slice(currentThoughtIndex).join('\n');
+                    vStr = thoughts.slice(currentThoughtIndex).join("\n");
                     currentThoughtIndex = thoughts.length;
                     foundStr = true;
                   }
                 }
-              } else if (delta.phase === 'answer') {
+              } else if (delta.phase === "answer") {
                 isThinkingChunk = false;
                 if (delta.content !== undefined) {
-                  const newContent = delta.content || '';
-                  const result = getIncrementalDelta(lastFullContent, newContent);
+                  const newContent = delta.content || "";
+                  const result = getIncrementalDelta(
+                    lastFullContent,
+                    newContent,
+                  );
                   vStr = result.delta;
                   if (vStr) {
                     lastFullContent = result.matchedContent;
@@ -271,48 +325,56 @@ export async function chatCompletions(c: Context) {
               }
             }
 
-            if (foundStr && vStr !== '') {
-              if (vStr === 'FINISHED') continue;
+            if (foundStr && vStr !== "") {
+              if (vStr === "FINISHED") continue;
               if (isThinkingChunk) {
                 reasoningBuffer += vStr;
               } else {
                 const { text, toolCalls } = toolParser.feed(vStr);
-                if (text) lastFullContent += '';
+                if (text) lastToolParsedText += text;
                 for (const tc of toolCalls) {
                   toolCallsOut.push({
                     id: tc.id,
-                    type: 'function',
+                    type: "function",
                     function: {
                       name: tc.name,
-                      arguments: JSON.stringify(tc.arguments)
-                    }
+                      arguments: JSON.stringify(tc.arguments),
+                    },
                   });
                 }
               }
             }
           } catch (e) {
             // parse error, ignore partial chunk
+            if (parseErrorLogCount < 5) {
+              console.warn("SSE chunk parse error:", e);
+              parseErrorLogCount++;
+            }
           }
         }
       }
 
       const upstreamError = parseQwenErrorPayload(buffer);
       if (upstreamError) {
-        return c.json({ error: { message: upstreamError.message } }, upstreamError.status as any);
+        return c.json(
+          { error: { message: upstreamError.message } },
+          upstreamError.status as any,
+        );
       }
 
-      const { text: remainingText, toolCalls: remainingToolCalls } = toolParser.flush();
+      const { text: remainingText, toolCalls: remainingToolCalls } =
+        toolParser.flush();
       if (remainingText) {
-        // remainingText has already been preserved in lastFullContent by getIncrementalDelta/feed path when present.
+        lastToolParsedText += remainingText;
       }
       for (const tc of remainingToolCalls) {
         toolCallsOut.push({
           id: tc.id,
-          type: 'function',
+          type: "function",
           function: {
             name: tc.name,
-            arguments: JSON.stringify(tc.arguments)
-          }
+            arguments: JSON.stringify(tc.arguments),
+          },
         });
       }
 
@@ -320,31 +382,39 @@ export async function chatCompletions(c: Context) {
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
         total_tokens: promptTokens + completionTokens,
-        prompt_tokens_details: { cached_tokens: 0 }
+        prompt_tokens_details: { cached_tokens: 0 },
       };
-      const message: any = { role: 'assistant', content: toolCallsOut.length ? null : lastFullContent };
+      const message: any = {
+        role: "assistant",
+        content: toolCallsOut.length
+          ? lastToolParsedText || null
+          : lastFullContent,
+      };
       if (reasoningBuffer) message.reasoning_content = reasoningBuffer;
-      if (toolCallsOut.length) toolCallsOut.forEach((tc, idx) => tc.index = idx);
+      if (toolCallsOut.length)
+        toolCallsOut.forEach((tc, idx) => (tc.index = idx));
       if (toolCallsOut.length) message.tool_calls = toolCallsOut;
 
       return c.json({
         id: completionId,
-        object: 'chat.completion',
+        object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model: body.model,
-        choices: [{
-          index: 0,
-          message,
-          logprobs: null,
-          finish_reason: toolCallsOut.length ? 'tool_calls' : 'stop'
-        }],
-        usage
+        choices: [
+          {
+            index: 0,
+            message,
+            logprobs: null,
+            finish_reason: toolCallsOut.length ? "tool_calls" : "stop",
+          },
+        ],
+        usage,
       });
     }
 
-    c.header('Content-Type', 'text/event-stream');
-    c.header('Cache-Control', 'no-cache');
-    c.header('Connection', 'keep-alive');
+    c.header("Content-Type", "text/event-stream");
+    c.header("Cache-Control", "no-cache");
+    c.header("Connection", "keep-alive");
 
     return honoStream(c, async (streamWriter: any) => {
       const writeEvent = async (data: any) => {
@@ -355,226 +425,279 @@ export async function chatCompletions(c: Context) {
         index: 0,
         delta,
         logprobs: null,
-        finish_reason: finishReason
+        finish_reason: finishReason,
       });
 
-      // Send initial chunk
-      await writeEvent({
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: body.model,
-        choices: [makeChoice({ role: 'assistant', content: '' })]
-      });
+      try {
+        // Send initial chunk
+        await writeEvent({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: body.model,
+          choices: [makeChoice({ role: "assistant", content: "" })],
+        });
 
-      const reader = stream.getReader();
-      const decoder = new TextDecoder();
-      
-      let inThinkingState = false;
-      let thinkingFragments: Record<string, boolean> = {};
-      let currentThoughtIndex = 0;
-      let currentAppendPath = '';
-      
-      let reasoningBuffer = '';
-      let lastFullContent = '';
-      const toolParser = new StreamingToolParser();
+        const reader = stream.getReader();
+        const decoder = new TextDecoder();
 
-      let buffer = '';
-      let completionTokens = 0;
-      let promptTokens = Math.ceil(finalPrompt.length / 3.5);
+        let currentThoughtIndex = 0;
+        let reasoningBuffer = "";
+        let lastFullContent = "";
+        const toolParser = new StreamingToolParser();
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        let buffer = "";
+        let completionTokens = 0;
+        let promptTokens = Math.ceil(finalPrompt.length / 3.5);
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data: ')) continue;
-          
-          const dataStr = trimmed.slice(6);
-          if (dataStr === '[DONE]') {
-            await streamWriter.write('data: [DONE]\n\n');
-            continue;
-          }
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
 
-          try {
-            const chunk = JSON.parse(dataStr);
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith("data: ")) continue;
 
-            // Extract response_id for session tracking
-            if (chunk['response.created'] && chunk['response.created'].response_id) {
-              updateSessionParent(uiSessionId, chunk['response.created'].response_id);
-            } else if (chunk.response_id) {
-              updateSessionParent(uiSessionId, chunk.response_id);
+            const dataStr = trimmed.slice(6);
+            if (dataStr === "[DONE]") {
+              await streamWriter.write("data: [DONE]\n\n");
+              continue;
             }
 
-            if (chunk.usage) {
-              if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
-              if (chunk.usage.input_tokens) promptTokens = chunk.usage.input_tokens;
-            }
+            try {
+              const chunk = JSON.parse(dataStr);
 
-            let vStr = '';
-            let foundStr = false;
-            let isThinkingChunk = false;
+              // Extract response_id for session tracking
+              if (
+                chunk["response.created"] &&
+                chunk["response.created"].response_id
+              ) {
+                updateSessionParent(
+                  uiSessionId,
+                  chunk["response.created"].response_id,
+                );
+              } else if (chunk.response_id) {
+                updateSessionParent(uiSessionId, chunk.response_id);
+              }
 
-            if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
-              const delta = chunk.choices[0].delta;
-              
-              if (delta.phase === 'thinking_summary') {
-                isThinkingChunk = true;
-                if (delta.extra && delta.extra.summary_thought && delta.extra.summary_thought.content) {
-                  const thoughts = delta.extra.summary_thought.content;
-                  if (thoughts.length > currentThoughtIndex) {
-                    vStr = thoughts.slice(currentThoughtIndex).join('\n');
-                    currentThoughtIndex = thoughts.length;
-                    foundStr = true;
+              if (chunk.usage) {
+                if (chunk.usage.output_tokens)
+                  completionTokens = chunk.usage.output_tokens;
+                if (chunk.usage.input_tokens)
+                  promptTokens = chunk.usage.input_tokens;
+              }
+
+              let vStr = "";
+              let foundStr = false;
+              let isThinkingChunk = false;
+
+              if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
+                const delta = chunk.choices[0].delta;
+
+                if (delta.phase === "thinking_summary") {
+                  isThinkingChunk = true;
+                  if (
+                    delta.extra &&
+                    delta.extra.summary_thought &&
+                    delta.extra.summary_thought.content
+                  ) {
+                    const thoughts = delta.extra.summary_thought.content;
+                    if (thoughts.length > currentThoughtIndex) {
+                      vStr = thoughts.slice(currentThoughtIndex).join("\n");
+                      currentThoughtIndex = thoughts.length;
+                      foundStr = true;
+                    }
                   }
-                }
-              } else if (delta.phase === 'answer') {
-                isThinkingChunk = false;
-                if (delta.content !== undefined) {
-                  const newContent = delta.content || '';
-                  const result = getIncrementalDelta(lastFullContent, newContent);
-                  vStr = result.delta;
-                  if (vStr) {
-                    lastFullContent = result.matchedContent;
-                    foundStr = true;
+                } else if (delta.phase === "answer") {
+                  isThinkingChunk = false;
+                  if (delta.content !== undefined) {
+                    const newContent = delta.content || "";
+                    const result = getIncrementalDelta(
+                      lastFullContent,
+                      newContent,
+                    );
+                    vStr = result.delta;
+                    if (vStr) {
+                      lastFullContent = result.matchedContent;
+                      foundStr = true;
+                    }
                   }
                 }
               }
-            }
 
-            if (foundStr && vStr !== '') {
-              if (vStr === 'FINISHED') continue;
+              if (foundStr && vStr !== "") {
+                if (vStr === "FINISHED") continue;
 
-              if (isThinkingChunk) {
-                inThinkingState = true;
-                reasoningBuffer += vStr;
-                await writeEvent({
-                  id: completionId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: body.model,
-                  choices: [makeChoice({ reasoning_content: vStr })]
-                });
-              } else {
-                inThinkingState = false;
-                const { text, toolCalls } = toolParser.feed(vStr);
-
-                if (text) {
+                if (isThinkingChunk) {
+                  reasoningBuffer += vStr;
                   await writeEvent({
                     id: completionId,
-                    object: 'chat.completion.chunk',
+                    object: "chat.completion.chunk",
                     created: Math.floor(Date.now() / 1000),
                     model: body.model,
-                    choices: [makeChoice({ content: text })]
+                    choices: [makeChoice({ reasoning_content: vStr })],
                   });
-                }
+                } else {
+                  const { text, toolCalls } = toolParser.feed(vStr);
 
-                for (const tc of toolCalls) {
-                  await writeEvent({
-                    id: completionId,
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: body.model,
-                    choices: [makeChoice({
-                      tool_calls: [{
-                        index: toolParser.getEmittedToolCallCount() - toolCalls.length + toolCalls.indexOf(tc),
-                        id: tc.id,
-                        type: 'function',
-                        function: {
-                          name: tc.name,
-                          arguments: JSON.stringify(tc.arguments)
-                        }
-                      }]
-                    })]
-                  });
+                  if (text) {
+                    await writeEvent({
+                      id: completionId,
+                      object: "chat.completion.chunk",
+                      created: Math.floor(Date.now() / 1000),
+                      model: body.model,
+                      choices: [makeChoice({ content: text })],
+                    });
+                  }
+
+                  for (const tc of toolCalls) {
+                    await writeEvent({
+                      id: completionId,
+                      object: "chat.completion.chunk",
+                      created: Math.floor(Date.now() / 1000),
+                      model: body.model,
+                      choices: [
+                        makeChoice({
+                          tool_calls: [
+                            {
+                              index:
+                                toolParser.getEmittedToolCallCount() -
+                                toolCalls.length +
+                                toolCalls.indexOf(tc),
+                              id: tc.id,
+                              type: "function",
+                              function: {
+                                name: tc.name,
+                                arguments: JSON.stringify(tc.arguments),
+                              },
+                            },
+                          ],
+                        }),
+                      ],
+                    });
+                  }
                 }
               }
+            } catch (e) {
+              // parse error, ignore partial chunk
+              if (parseErrorLogCount < 5) {
+                console.warn("SSE chunk parse error:", e);
+                parseErrorLogCount++;
+              }
             }
-          } catch (e) {
-            // parse error, ignore partial chunk
           }
         }
-      }
 
-      const upstreamError = parseQwenErrorPayload(buffer);
-      if (upstreamError) {
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model,
-          choices: [makeChoice({ content: upstreamError.message })]
-        });
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model,
-          choices: [makeChoice({}, 'stop')]
-        });
-        await streamWriter.write('data: [DONE]\n\n');
-        return;
-      }
+        const upstreamError = parseQwenErrorPayload(buffer);
+        if (upstreamError) {
+          await writeEvent({
+            id: completionId,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: body.model,
+            choices: [makeChoice({ content: upstreamError.message })],
+          });
+          await writeEvent({
+            id: completionId,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: body.model,
+            choices: [makeChoice({}, "stop")],
+          });
+          await streamWriter.write("data: [DONE]\n\n");
+          return;
+        }
 
-      // Flush tool parser
-      const { text: remainingText, toolCalls: remainingToolCalls } = toolParser.flush();
-      if (remainingText) {
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model,
-          choices: [makeChoice({ content: remainingText })]
-        });
-      }
-      for (const tc of remainingToolCalls) {
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model,
-          choices: [makeChoice({
-            tool_calls: [{
-              index: toolParser.getEmittedToolCallCount() - remainingToolCalls.length + remainingToolCalls.indexOf(tc),
-              id: tc.id,
-              type: 'function',
-              function: {
-                name: tc.name,
-                arguments: JSON.stringify(tc.arguments)
-              }
-            }]
-          })]
-        });
-      }
-  
-      // Send finish reason
-      const usage = {
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
-        prompt_tokens_details: { cached_tokens: 0 }
-      };
-  
-      const finalFinishReason = toolParser.getEmittedToolCallCount() > 0 ? 'tool_calls' : 'stop';
-  
-      await writeEvent({
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: body.model,
-        choices: [makeChoice({}, finalFinishReason)],
-        usage: usage
-      });
-      await streamWriter.write('data: [DONE]\n\n');
+        // Flush tool parser
+        const { text: remainingText, toolCalls: remainingToolCalls } =
+          toolParser.flush();
+        if (remainingText) {
+          await writeEvent({
+            id: completionId,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: body.model,
+            choices: [makeChoice({ content: remainingText })],
+          });
+        }
+        for (const tc of remainingToolCalls) {
+          await writeEvent({
+            id: completionId,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: body.model,
+            choices: [
+              makeChoice({
+                tool_calls: [
+                  {
+                    index:
+                      toolParser.getEmittedToolCallCount() -
+                      remainingToolCalls.length +
+                      remainingToolCalls.indexOf(tc),
+                    id: tc.id,
+                    type: "function",
+                    function: {
+                      name: tc.name,
+                      arguments: JSON.stringify(tc.arguments),
+                    },
+                  },
+                ],
+              }),
+            ],
+          });
+        }
 
+        // Send finish reason
+        const usage = {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+          prompt_tokens_details: { cached_tokens: 0 },
+        };
+
+        const finalFinishReason =
+          toolParser.getEmittedToolCallCount() > 0 ? "tool_calls" : "stop";
+
+        await writeEvent({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: body.model,
+          choices: [makeChoice({}, finalFinishReason)],
+          usage: usage,
+        });
+        await streamWriter.write("data: [DONE]\n\n");
+      } catch (err: any) {
+        console.error("Error in streaming callback:", err);
+        try {
+          await streamWriter.write(
+            `data: ${JSON.stringify({
+              id: completionId,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: body.model,
+              choices: [
+                {
+                  index: 0,
+                  delta: { content: `Error: ${err.message}` },
+                  logprobs: null,
+                  finish_reason: "stop",
+                },
+              ],
+            })}\n\n`,
+          );
+        } catch {}
+        try {
+          await streamWriter.write("data: [DONE]\n\n");
+        } catch {}
+      }
     });
   } catch (err: any) {
-    console.error('Error in chatCompletions:', err);
+    console.error("Error in chatCompletions:", err);
     return c.json({ error: { message: err.message } }, 500);
   }
 }
