@@ -210,6 +210,7 @@ export async function chatCompletions(c: Context) {
       let reasoningBuffer = '';
       let lastFullContent = '';
       const toolParser = new StreamingToolParser();
+      const toolParserReasoning = new StreamingToolParser();
       const toolCallsOut: any[] = [];
       let buffer = '';
       let completionTokens = 0;
@@ -276,9 +277,20 @@ export async function chatCompletions(c: Context) {
 
             if (foundStr && vStr !== '') {
               if (vStr === 'FINISHED') continue;
-              if (isThinkingChunk) {
-                reasoningBuffer += vStr;
-              } else {
+            if (isThinkingChunk) {
+                const { text: reasonText, toolCalls: reasonToolCalls } = toolParserReasoning.feed(vStr);
+                if (reasonText) reasoningBuffer += reasonText;
+                for (const tc of reasonToolCalls) {
+                    toolCallsOut.push({
+                        id: tc.id,
+                        type: 'function',
+                        function: {
+                            name: tc.name,
+                            arguments: JSON.stringify(tc.arguments)
+                        }
+                    });
+                }
+            } else {
                 const { text, toolCalls } = toolParser.feed(vStr);
                 if (text) lastFullContent += '';
                 for (const tc of toolCalls) {
@@ -306,6 +318,18 @@ export async function chatCompletions(c: Context) {
       }
 
       const { text: remainingText, toolCalls: remainingToolCalls } = toolParser.flush();
+      const { text: remainingReasonText, toolCalls: remainingReasonToolCalls } = toolParserReasoning.flush();
+      if (remainingReasonText) reasoningBuffer += remainingReasonText;
+      for (const tc of remainingReasonToolCalls) {
+          toolCallsOut.push({
+              id: tc.id,
+              type: 'function',
+              function: {
+                  name: tc.name,
+                  arguments: JSON.stringify(tc.arguments)
+              }
+          });
+      }
       if (remainingText) {
         // remainingText has already been preserved in lastFullContent by getIncrementalDelta/feed path when present.
       }
@@ -383,6 +407,8 @@ export async function chatCompletions(c: Context) {
       let reasoningBuffer = '';
       let lastFullContent = '';
       const toolParser = new StreamingToolParser();
+      const toolParserReasoning = new StreamingToolParser();
+      let reasoningHadToolCalls = false;
 
       let buffer = '';
       let completionTokens = 0;
@@ -455,17 +481,44 @@ export async function chatCompletions(c: Context) {
             if (foundStr && vStr !== '') {
               if (vStr === 'FINISHED') continue;
 
-              if (isThinkingChunk) {
+            if (isThinkingChunk) {
                 inThinkingState = true;
-                reasoningBuffer += vStr;
-                await writeEvent({
-                  id: completionId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: body.model,
-                  choices: [makeChoice({ reasoning_content: vStr })]
-});
-              } else {
+                const { text: reasonText, toolCalls: reasonToolCalls } = toolParserReasoning.feed(vStr);
+
+                if (reasonToolCalls.length > 0) {
+                    reasoningHadToolCalls = true;
+                    for (const tc of reasonToolCalls) {
+                        await writeEvent({
+                            id: completionId,
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: body.model,
+                            choices: [makeChoice({
+                                tool_calls: [{
+                                    index: toolParserReasoning.getEmittedToolCallCount() - reasonToolCalls.length + reasonToolCalls.indexOf(tc),
+                                    id: tc.id,
+                                    type: 'function',
+                                    function: {
+                                        name: tc.name,
+                                        arguments: JSON.stringify(tc.arguments)
+                                    }
+                                }]
+                            })]
+                        });
+                    }
+                }
+
+                if (reasonText) {
+                    reasoningBuffer += reasonText;
+                    await writeEvent({
+                        id: completionId,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: body.model,
+                        choices: [makeChoice({ reasoning_content: reasonText })]
+                    });
+                }
+            } else {
                 inThinkingState = false;
                 const { text, toolCalls } = toolParser.feed(vStr);
 
@@ -557,6 +610,31 @@ export async function chatCompletions(c: Context) {
         });
       }
   
+        const { text: remainingReasonText, toolCalls: remainingReasonToolCalls } = toolParserReasoning.flush();
+        if (remainingReasonText) {
+            reasoningBuffer += remainingReasonText;
+        }
+        for (const tc of remainingReasonToolCalls) {
+            reasoningHadToolCalls = true;
+            await writeEvent({
+                id: completionId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: body.model,
+                choices: [makeChoice({
+                    tool_calls: [{
+                        index: toolParserReasoning.getEmittedToolCallCount() - remainingReasonToolCalls.length + remainingReasonToolCalls.indexOf(tc),
+                        id: tc.id,
+                        type: 'function',
+                        function: {
+                            name: tc.name,
+                            arguments: JSON.stringify(tc.arguments)
+                        }
+                    }]
+                })]
+            });
+        }
+
       // Send finish reason
       const usage = {
         prompt_tokens: promptTokens,
@@ -565,7 +643,7 @@ export async function chatCompletions(c: Context) {
         prompt_tokens_details: { cached_tokens: 0 }
       };
   
-      const finalFinishReason = toolParser.getEmittedToolCallCount() > 0 ? 'tool_calls' : 'stop';
+      const finalFinishReason = (toolParser.getEmittedToolCallCount() > 0 || toolParserReasoning.getEmittedToolCallCount() > 0) ? 'tool_calls' : 'stop';
   
       await writeEvent({
         id: completionId,
