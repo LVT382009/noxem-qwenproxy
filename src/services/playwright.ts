@@ -35,6 +35,31 @@ const HEADERS_TTL = 10 * 60 * 1000; // 10 minutes
 
 let uiLock: Promise<void> = Promise.resolve();
 
+export class Mutex {
+	private queue: (() => void)[] = [];
+	private locked = false;
+
+	async acquire(): Promise<() => void> {
+		return new Promise((resolve) => {
+			const tryAcquire = () => {
+				if (!this.locked) {
+					this.locked = true;
+					resolve(() => {
+						this.locked = false;
+						if (this.queue.length > 0) {
+							const next = this.queue.shift()!;
+							next();
+						}
+					});
+				} else {
+					this.queue.push(tryAcquire);
+				}
+			};
+			tryAcquire();
+		});
+	}
+}
+
 const INPUT_SELECTOR = 'textarea:visible, [contenteditable="true"]:visible';
 const SEND_SELECTORS = [
 	".message-input-right-button-send .send-button",
@@ -113,6 +138,7 @@ export async function initPlaywright(
 		channel,
 		userAgent:
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+		ignoreDefaultArgs: ["--enable-automation"],
 		args: [
 			"--disable-blink-features=AutomationControlled",
 			"--no-sandbox",
@@ -126,10 +152,68 @@ export async function initPlaywright(
 	});
 
 	await context.addInitScript(() => {
-		Object.defineProperty(navigator, "webdriver", { get: () => false });
+		Object.defineProperty(navigator, "webdriver", { get: () => undefined });
 	});
 
 	activePage = await context.newPage();
+
+	const hasCredentials = !!(process.env.QWEN_EMAIL && process.env.QWEN_PASSWORD);
+	const hasValidSession = await checkValidSession();
+
+	if (!hasValidSession && !hasCredentials) {
+		console.warn("[Playwright] No valid session AND no credentials in .env. Manual login will be required.");
+	}
+
+	if (!hasValidSession) {
+		await attemptAutoLogin();
+	}
+}
+
+async function checkValidSession(): Promise<boolean> {
+	if (!activePage) return false;
+	try {
+		const cookies = await activePage.context().cookies();
+		const hasAuthCookie = cookies.some(
+			(c) =>
+				c.name.toLowerCase().includes("token") ||
+				c.name.toLowerCase().includes("session"),
+		);
+		if (!hasAuthCookie) return false;
+		await activePage.goto("https://chat.qwen.ai/", {
+			waitUntil: "domcontentloaded",
+			timeout: 10000,
+		});
+		const isLogged =
+			!activePage.url().includes("auth") &&
+			!activePage.url().includes("login");
+		return isLogged;
+	} catch {
+		return false;
+	}
+}
+
+async function attemptAutoLogin(): Promise<void> {
+	const email = process.env.QWEN_EMAIL;
+	const password = process.env.QWEN_PASSWORD;
+	if (!email || !password) return;
+	console.log("[Playwright] Attempting auto-login with credentials from .env...");
+	try {
+		const success = await loginToQwenViaApi(email, password);
+		if (success) {
+			console.log("[Playwright] Auto-login successful.");
+			return;
+		}
+		console.warn("[Playwright] API login failed, trying UI fallback...");
+		const uiSuccess = await loginToQwen(email, password);
+		if (uiSuccess) {
+			console.log("[Playwright] UI login fallback successful.");
+		} else {
+			console.warn("[Playwright] Both API and UI login failed. Manual login may be required.");
+		}
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		console.error("[Playwright] Auto-login error:", msg);
+	}
 }
 
 export async function closePlaywright() {

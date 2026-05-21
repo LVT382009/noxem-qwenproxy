@@ -17,13 +17,22 @@ import { registry } from '../tools/registry.ts';
 import type { FunctionToolDefinition } from '../tools/types.ts';
 import { robustParseJSON } from '../utils/json.ts';
 import { StreamingToolParser } from '../tools/parser.ts';
+import { Mutex } from '../services/playwright.ts';
 
-interface DeltaResult {
+// Global mutex that serializes ALL Qwen chat completions requests.
+// The Qwen web backend is stateful: it only allows one generation at a time
+// per session. Concurrent requests to the same session produce:
+// "Bad_Request: The chat is in progress!"
+// A single global lock is the safest approach because the proxy currently
+// shares one browser session (and therefore one Qwen auth context).
+const qwenChatMutex = new Mutex();
+
+export interface DeltaResult {
   delta: string;
   matchedContent: string;
 }
 
-function getIncrementalDelta(oldStr: string, newStr: string): DeltaResult {
+export function getIncrementalDelta(oldStr: string, newStr: string): DeltaResult {
   if (!oldStr) {
     return { delta: newStr, matchedContent: newStr };
   }
@@ -47,30 +56,9 @@ function getIncrementalDelta(oldStr: string, newStr: string): DeltaResult {
     };
   }
 
-  // Fallback: If oldStr is found anywhere in newStr, return the suffix after it
-  const idx = newStr.indexOf(oldStr);
-  if (idx !== -1) {
-    return {
-      delta: newStr.substring(idx + oldStr.length),
-      matchedContent: newStr
-    };
-  }
-
-  // Sliding overlap search: find the longest suffix of oldStr that exists in newStr
-  const suffixMinLength = Math.min(oldStr.length, 4);
-  const suffixMaxSearch = Math.min(oldStr.length, 30);
-  for (let i = suffixMaxSearch; i >= suffixMinLength; i--) {
-    const suffix = oldStr.slice(-i);
-    const lastIdx = newStr.lastIndexOf(suffix);
-    if (lastIdx !== -1) {
-      return {
-        delta: newStr.substring(lastIdx + suffix.length),
-        matchedContent: newStr
-      };
-    }
-  }
-
-  // Otherwise, it is strictly incremental (or pure delta):
+  // If the prefix check fails, we treat it as strictly incremental (or pure delta).
+  // We avoid fallback search/sliding overlap checks which cause disastrous false-positive
+  // corruptions on incremental streams with repetitive code/words (like "import {", "const", etc.).
   return {
     delta: newStr,
     matchedContent: oldStr + newStr
@@ -137,7 +125,7 @@ export async function chatCompletions(c: Context) {
            for (const tc of msg.tool_calls) {
              let args = tc.function?.arguments || '{}';
              if (typeof args !== 'string') args = JSON.stringify(args);
-             assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
+             assistantContent += `\nতত{"name": "${tc.function?.name}", "arguments": ${args}}✨`;
            }
         }
         prompt += `Assistant: ${assistantContent.trim()}\n\n`;
@@ -178,10 +166,17 @@ export async function chatCompletions(c: Context) {
     // This handles cases where the first request has [System, User] messages.
     const isNewSession = !messages.some(m => m.role === 'assistant');
 
-    // Empty response retry logic
+    // Acquire the global Qwen chat mutex to prevent concurrent generations.
+    // The Qwen backend only allows one active generation per session; without
+    // this lock, parallel requests would race and one would get:
+    // "Bad_Request: The chat is in progress!"
+    const releaseChatLock = await qwenChatMutex.acquire();
+
+    // Retry logic with exponential backoff for "chat is in progress" errors
     let stream: ReadableStream;
     let uiSessionId = '';
-    let retries = 3;
+    let retries = 5;
+    let retryDelay = 1000;
     while (retries > 0) {
       try {
         // If it's a new session, force parent_message_id to null
@@ -191,9 +186,17 @@ export async function chatCompletions(c: Context) {
         break; // Success
       } catch (err: any) {
         retries--;
-        if (retries === 0) throw err;
+        const isInProgress = err.message?.includes('in progress') || err.message?.includes('Bad_Request');
+        if (retries === 0) {
+        	releaseChatLock();
+        	throw err;
+        }
         // Wait a bit before retrying
-        await new Promise(r => setTimeout(r, 1000));
+        console.warn(`[Chat] Qwen request failed (${isInProgress ? 'in progress' : 'other'}), retrying in ${retryDelay}ms... (${retries} left)`);
+        await new Promise(r => setTimeout(r, retryDelay));
+        if (isInProgress) {
+        	retryDelay = Math.min(retryDelay * 2, 10000); // Exponential backoff, max 10s
+        }
       }
     }
 
@@ -298,6 +301,7 @@ export async function chatCompletions(c: Context) {
 
       const upstreamError = parseQwenErrorPayload(buffer);
       if (upstreamError) {
+      	releaseChatLock();
         return c.json({ error: { message: upstreamError.message } }, upstreamError.status as any);
       }
 
@@ -347,6 +351,7 @@ export async function chatCompletions(c: Context) {
     c.header('Connection', 'keep-alive');
 
     return honoStream(c, async (streamWriter: any) => {
+    try {
       const writeEvent = async (data: any) => {
         await streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
       };
@@ -459,7 +464,7 @@ export async function chatCompletions(c: Context) {
                   created: Math.floor(Date.now() / 1000),
                   model: body.model,
                   choices: [makeChoice({ reasoning_content: vStr })]
-                });
+});
               } else {
                 inThinkingState = false;
                 const { text, toolCalls } = toolParser.feed(vStr);
@@ -572,7 +577,10 @@ export async function chatCompletions(c: Context) {
       });
       await streamWriter.write('data: [DONE]\n\n');
 
-    });
+     } finally {
+  releaseChatLock();
+  }
+});
   } catch (err: any) {
     console.error('Error in chatCompletions:', err);
     return c.json({ error: { message: err.message } }, 500);
