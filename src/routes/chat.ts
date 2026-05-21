@@ -91,6 +91,55 @@ function parseQwenErrorPayload(raw: string): { message: string; status: number }
   return null;
 }
 
+function extractBareToolCalls(text: string): { toolCalls: any[]; cleanText: string } {
+    const toolCalls: any[] = [];
+    const removeRanges: [number, number][] = [];
+    const nameRe = /\{"name"\s*:\s*"/g;
+    let nameMatch;
+    while ((nameMatch = nameRe.exec(text)) !== null) {
+        const startIdx = nameMatch.index;
+        let depth = 0;
+        let i = startIdx;
+        let inStr = false;
+        let escaped = false;
+        for (; i < text.length; i++) {
+            const ch = text[i];
+            if (escaped) { escaped = false; continue; }
+            if (ch === '\\') { escaped = true; continue; }
+            if (ch === '"') { inStr = !inStr; continue; }
+            if (inStr) continue;
+            if (ch === '{') depth++;
+            else if (ch === '}') { depth--; if (depth === 0) break; }
+        }
+        if (depth === 0 && i < text.length) {
+            const endIdx = i + 1;
+            const jsonStr = text.substring(startIdx, endIdx);
+            try {
+                const obj = robustParseJSON(jsonStr) as Record<string, unknown>;
+                if (obj && typeof obj.name === 'string' && obj.arguments !== undefined) {
+                    const toolId = `call_${uuidv4()}`;
+                    let args = obj.arguments;
+                    if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
+                    toolCalls.push({ id: toolId, type: 'function', function: { name: obj.name, arguments: JSON.stringify(args) } });
+                    removeRanges.push([startIdx, endIdx]);
+                }
+            } catch { /* not valid JSON, skip */ }
+        }
+    }
+    let cleanText = text;
+    if (removeRanges.length > 0) {
+        let result = '';
+        let lastEnd = 0;
+        for (const [s, e] of removeRanges) {
+            result += text.substring(lastEnd, s);
+            lastEnd = e;
+        }
+        result += text.substring(lastEnd);
+        cleanText = result.trim();
+    }
+    return { toolCalls, cleanText };
+}
+
 export async function chatCompletions(c: Context) {
   try {
     const body: OpenAIRequest = await c.req.json();
@@ -342,6 +391,17 @@ export async function chatCompletions(c: Context) {
             arguments: JSON.stringify(tc.arguments)
           }
         });
+      }
+
+      // Fallback: if no delimited tool calls found, scan reasoningBuffer for bare JSON tool calls
+      if (toolCallsOut.length === 0 && reasoningBuffer) {
+          const { toolCalls: bareToolCalls, cleanText } = extractBareToolCalls(reasoningBuffer);
+          for (const tc of bareToolCalls) {
+              toolCallsOut.push(tc);
+          }
+          if (bareToolCalls.length > 0) {
+              reasoningBuffer = cleanText;
+          }
       }
 
       const usage = {
@@ -634,6 +694,24 @@ export async function chatCompletions(c: Context) {
                 })]
             });
         }
+
+      // Fallback: if no delimited tool calls found, scan reasoningBuffer for bare JSON tool calls
+      if (toolParserReasoning.getEmittedToolCallCount() === 0 && toolParser.getEmittedToolCallCount() === 0 && reasoningBuffer) {
+          const { toolCalls: bareToolCalls, cleanText } = extractBareToolCalls(reasoningBuffer);
+          if (bareToolCalls.length > 0) {
+              reasoningHadToolCalls = true;
+              for (const tc of bareToolCalls) {
+                  await writeEvent({
+                      id: completionId,
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: body.model,
+                      choices: [makeChoice({ tool_calls: [tc] })]
+                  });
+              }
+              reasoningBuffer = cleanText;
+          }
+      }
 
       // Send finish reason
       const usage = {
