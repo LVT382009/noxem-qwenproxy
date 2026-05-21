@@ -47,7 +47,30 @@ export function robustParseJSON(str: string): unknown {
 		const char = cleaned[i];
 
 		if (escaped) {
-			fixedJson += char;
+			const validEscapes = ['n', 'r', 't', 'u', '"', '\\', '/'];
+			if (validEscapes.includes(char)) {
+				if (char === 'u') {
+					const next4 = cleaned.substring(i + 1, i + 5);
+					const isHex = /^[0-9a-fA-F]{4}$/.test(next4);
+					if (isHex) {
+						fixedJson += '\\' + char;
+					} else {
+						fixedJson += '\\\\' + char;
+					}
+				} else if (['n', 'r', 't'].includes(char)) {
+					const isWinPath = /[a-zA-Z]:\\/i.test(cleaned) || /[a-zA-Z]:\//i.test(cleaned);
+					const nextChar = cleaned[i + 1] || '';
+					if (isWinPath && /^[a-zA-Z0-9]/.test(nextChar)) {
+						fixedJson += '\\\\' + char;
+					} else {
+						fixedJson += '\\' + char;
+					}
+				} else {
+					fixedJson += '\\' + char;
+				}
+			} else {
+				fixedJson += '\\\\' + char;
+			}
 			escaped = false;
 			continue;
 		}
@@ -120,20 +143,35 @@ export function robustParseJSON(str: string): unknown {
 		for (let i = 0; i < aggressive.length; i++) {
 			const char = aggressive[i];
 			if (esc) {
-				aggFixed += char;
+				const validEscapes = ['n', 'r', 't', 'u', '"', '\\', '/'];
+				if (validEscapes.includes(char)) {
+					if (char === 'u') {
+						const next4 = aggressive.substring(i + 1, i + 5);
+						const isHex = /^[0-9a-fA-F]{4}$/.test(next4);
+						if (isHex) {
+							aggFixed += '\\' + char;
+						} else {
+							aggFixed += '\\\\' + char;
+						}
+					} else if (['n', 'r', 't'].includes(char)) {
+						const isWinPath = /[a-zA-Z]:\\/i.test(aggressive) || /[a-zA-Z]:\//i.test(aggressive);
+						const nextChar = aggressive[i + 1] || '';
+						if (isWinPath && /^[a-zA-Z0-9]/.test(nextChar)) {
+							aggFixed += '\\\\' + char;
+						} else {
+							aggFixed += '\\' + char;
+						}
+					} else {
+						aggFixed += '\\' + char;
+					}
+				} else {
+					aggFixed += '\\\\' + char;
+				}
 				esc = false;
 				continue;
 			}
-			if (char === "\\") {
-				aggFixed += char;
-				esc = true;
-				continue;
-			}
-			if (char === '"') {
-				is = !is;
-				aggFixed += char;
-				continue;
-			}
+			if (char === "\\") { esc = true; continue; }
+			if (char === '"') { is = !is; aggFixed += char; continue; }
 
 			if (is) {
 				if (char === "\n") aggFixed += "\\n";

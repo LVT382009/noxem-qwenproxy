@@ -113,6 +113,7 @@ export async function initPlaywright(
 		channel,
 		userAgent:
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+		ignoreDefaultArgs: ['--enable-automation'],
 		args: [
 			"--disable-blink-features=AutomationControlled",
 			"--no-sandbox",
@@ -125,8 +126,9 @@ export async function initPlaywright(
 		],
 	});
 
+	// Bypass navigator.webdriver detection
 	await context.addInitScript(() => {
-		Object.defineProperty(navigator, "webdriver", { get: () => false });
+		Object.defineProperty(navigator, "webdriver", { get: () => undefined });
 	});
 
 	activePage = await context.newPage();
@@ -496,4 +498,32 @@ async function _fetchQwenHeaders(forceNew = false): Promise<{
 				await activePage?.keyboard.press("Enter");
 			});
 	});
+}
+
+export class Mutex {
+	private queue: (() => void)[] = [];
+	private locked = false;
+
+	acquire(): Promise<() => void> {
+		return new Promise((resolve) => {
+			const tryAcquire = () => {
+				if (!this.locked) {
+					this.locked = true;
+					resolve(() => this.release());
+				} else {
+					this.queue.push(tryAcquire);
+				}
+			};
+			tryAcquire();
+		});
+	}
+
+	private release() {
+		if (this.queue.length > 0) {
+			const next = this.queue.shift();
+			if (next) next();
+		} else {
+			this.locked = false;
+		}
+	}
 }
