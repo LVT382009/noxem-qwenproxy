@@ -3,7 +3,7 @@ FROM mcr.microsoft.com/playwright:v1.60.0-jammy
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci && npm cache clean --force
+RUN npm ci --omit=dev && npm cache clean --force
 
 COPY . .
 

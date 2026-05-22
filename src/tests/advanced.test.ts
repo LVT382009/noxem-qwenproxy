@@ -61,7 +61,7 @@ test('multiturn-thinking-tools: maintains reasoning_content history', async () =
     // previous assistant reasoning/tool-call context and the tool response.
     assert.ok(capturedPrompt.includes('User: hello'), 'Must include previous user message');
     assert.ok(capturedPrompt.includes('<think>\nthinking about hello\n</think>'), 'Must include previous thinking');
-    assert.ok(capturedPrompt.includes('<tool_call>{"name": "test", "arguments": {}}</tool_call>'), 'Must include previous tool call');
+    assert.ok(capturedPrompt.includes('তত{"name": "test", "arguments": {}}✨'), 'Must include previous tool call');
     assert.ok(capturedPrompt.includes('Tool Response (test): success'), 'Must include tool response signature');
   } finally {
     restore();

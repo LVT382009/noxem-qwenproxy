@@ -4,6 +4,34 @@
  * Robust JSON parsing utilities
  */
 
+
+function normalizeEscapeSequence(char: string, src: string, i: number): string {
+const validEscapes = ['n', 'r', 't', 'u', '"', '\\', '/'];
+if (validEscapes.includes(char)) {
+	if (char === 'u') {
+		const next4 = src.substring(i + 1, i + 5);
+		const isHex = /^[0-9a-fA-F]{4}$/.test(next4);
+		if (isHex) {
+			return '\\' + char;
+		} else {
+			return '\\\\' + char;
+		}
+	} else if (['n', 'r', 't'].includes(char)) {
+		const isWinPath = /[a-zA-Z]:\\/i.test(src) || /[a-zA-Z]:\//i.test(src);
+		const nextChar = src[i + 1] || '';
+		if (isWinPath && /^[a-zA-Z0-9]/.test(nextChar)) {
+			return '\\\\' + char;
+		} else {
+			return '\\' + char;
+		}
+	} else {
+		return '\\' + char;
+	}
+} else {
+	return '\\\\' + char;
+}
+}
+
 export function robustParseJSON(str: string): unknown {
 	let sanitized = str.trim();
 
@@ -47,13 +75,12 @@ export function robustParseJSON(str: string): unknown {
 		const char = cleaned[i];
 
 		if (escaped) {
-			fixedJson += char;
+			fixedJson += normalizeEscapeSequence(char, cleaned, i);
 			escaped = false;
 			continue;
 		}
 
 		if (char === "\\") {
-			fixedJson += char;
 			escaped = true;
 			continue;
 		}
@@ -85,6 +112,7 @@ export function robustParseJSON(str: string): unknown {
 		}
 	}
 
+	if (escaped) fixedJson += "\\\\";
 	let tempJson = fixedJson;
 
 	// If we found a point where it was balanced and there is trailing noise or it didn't stay balanced
@@ -120,20 +148,12 @@ export function robustParseJSON(str: string): unknown {
 		for (let i = 0; i < aggressive.length; i++) {
 			const char = aggressive[i];
 			if (esc) {
-				aggFixed += char;
-				esc = false;
-				continue;
-			}
-			if (char === "\\") {
-				aggFixed += char;
-				esc = true;
-				continue;
-			}
-			if (char === '"') {
-				is = !is;
-				aggFixed += char;
-				continue;
-			}
+			aggFixed += normalizeEscapeSequence(char, aggressive, i);
+			esc = false;
+			continue;
+		}
+			if (char === "\\") { esc = true; continue; }
+			if (char === '"') { is = !is; aggFixed += char; continue; }
 
 			if (is) {
 				if (char === "\n") aggFixed += "\\n";
@@ -149,7 +169,8 @@ export function robustParseJSON(str: string): unknown {
 			}
 		}
 
-		if (bk > 0) aggFixed += "]".repeat(bk);
+		if (esc) aggFixed += "\\\\";
+	if (bk > 0) aggFixed += "]".repeat(bk);
 		if (ob > 0) aggFixed += "}".repeat(ob);
 
 		try {
