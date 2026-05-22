@@ -4,6 +4,34 @@
  * Robust JSON parsing utilities
  */
 
+
+function normalizeEscapeSequence(char: string, src: string, i: number): string {
+const validEscapes = ['n', 'r', 't', 'u', '"', '\\', '/'];
+if (validEscapes.includes(char)) {
+	if (char === 'u') {
+		const next4 = src.substring(i + 1, i + 5);
+		const isHex = /^[0-9a-fA-F]{4}$/.test(next4);
+		if (isHex) {
+			return '\\' + char;
+		} else {
+			return '\\\\' + char;
+		}
+	} else if (['n', 'r', 't'].includes(char)) {
+		const isWinPath = /[a-zA-Z]:\\/i.test(src) || /[a-zA-Z]:\//i.test(src);
+		const nextChar = src[i + 1] || '';
+		if (isWinPath && /^[a-zA-Z0-9]/.test(nextChar)) {
+			return '\\\\' + char;
+		} else {
+			return '\\' + char;
+		}
+	} else {
+		return '\\' + char;
+	}
+} else {
+	return '\\\\' + char;
+}
+}
+
 export function robustParseJSON(str: string): unknown {
 	let sanitized = str.trim();
 
@@ -47,30 +75,7 @@ export function robustParseJSON(str: string): unknown {
 		const char = cleaned[i];
 
 		if (escaped) {
-			const validEscapes = ['n', 'r', 't', 'u', '"', '\\', '/'];
-			if (validEscapes.includes(char)) {
-				if (char === 'u') {
-					const next4 = cleaned.substring(i + 1, i + 5);
-					const isHex = /^[0-9a-fA-F]{4}$/.test(next4);
-					if (isHex) {
-						fixedJson += '\\' + char;
-					} else {
-						fixedJson += '\\\\' + char;
-					}
-				} else if (['n', 'r', 't'].includes(char)) {
-					const isWinPath = /[a-zA-Z]:\\/i.test(cleaned) || /[a-zA-Z]:\//i.test(cleaned);
-					const nextChar = cleaned[i + 1] || '';
-					if (isWinPath && /^[a-zA-Z0-9]/.test(nextChar)) {
-						fixedJson += '\\\\' + char;
-					} else {
-						fixedJson += '\\' + char;
-					}
-				} else {
-					fixedJson += '\\' + char;
-				}
-			} else {
-				fixedJson += '\\\\' + char;
-			}
+			fixedJson += normalizeEscapeSequence(char, cleaned, i);
 			escaped = false;
 			continue;
 		}
@@ -143,33 +148,10 @@ export function robustParseJSON(str: string): unknown {
 		for (let i = 0; i < aggressive.length; i++) {
 			const char = aggressive[i];
 			if (esc) {
-				const validEscapes = ['n', 'r', 't', 'u', '"', '\\', '/'];
-				if (validEscapes.includes(char)) {
-					if (char === 'u') {
-						const next4 = aggressive.substring(i + 1, i + 5);
-						const isHex = /^[0-9a-fA-F]{4}$/.test(next4);
-						if (isHex) {
-							aggFixed += '\\' + char;
-						} else {
-							aggFixed += '\\\\' + char;
-						}
-					} else if (['n', 'r', 't'].includes(char)) {
-						const isWinPath = /[a-zA-Z]:\\/i.test(aggressive) || /[a-zA-Z]:\//i.test(aggressive);
-						const nextChar = aggressive[i + 1] || '';
-						if (isWinPath && /^[a-zA-Z0-9]/.test(nextChar)) {
-							aggFixed += '\\\\' + char;
-						} else {
-							aggFixed += '\\' + char;
-						}
-					} else {
-						aggFixed += '\\' + char;
-					}
-				} else {
-					aggFixed += '\\\\' + char;
-				}
-				esc = false;
-				continue;
-			}
+			aggFixed += normalizeEscapeSequence(char, aggressive, i);
+			esc = false;
+			continue;
+		}
 			if (char === "\\") { esc = true; continue; }
 			if (char === '"') { is = !is; aggFixed += char; continue; }
 

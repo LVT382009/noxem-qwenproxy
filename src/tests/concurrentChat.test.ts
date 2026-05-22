@@ -18,14 +18,16 @@ function isPortAvailable(port: number): Promise<boolean> {
 
 async function getFreePort(startPort: number): Promise<number> {
 	let port = startPort;
-	while (true) {
+	const maxAttempts = 100;
+	for (let i = 0; i < maxAttempts; i++) {
 		const available = await isPortAvailable(port);
 		if (available) return port;
 		port++;
 	}
+	throw new Error("No available port found in range " + startPort + "-" + (startPort + maxAttempts - 1));
 }
 
-test('Concurrent chat requests check for "chat is in progress"', async () => {
+test('Concurrent chat requests are serialized and both succeed', async () => {
 	const port = await getFreePort(3100);
 	const server = serve({ fetch: app.fetch, port });
 	console.log(`[ConcurrentTest] Server started on port ${port}`);

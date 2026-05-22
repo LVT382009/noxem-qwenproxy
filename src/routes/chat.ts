@@ -279,7 +279,7 @@ export async function chatCompletions(c: Context) {
 								reasoningBuffer += vStr;
 							} else {
 								const { text, toolCalls } = toolParser.feed(vStr);
-								if (text) lastFullContent += '';
+								// text is the non-tool content; lastFullContent already tracks via getIncrementalDelta
 								for (const tc of toolCalls) {
 									toolCallsOut.push({
 										id: tc.id,
@@ -327,7 +327,9 @@ export async function chatCompletions(c: Context) {
 			};
 			const message: any = { role: 'assistant', content: toolCallsOut.length ? null : lastFullContent };
 			if (reasoningBuffer) message.reasoning_content = reasoningBuffer;
-			if (toolCallsOut.length) toolCallsOut.forEach((tc, idx) => tc.index = idx);
+			for (let idx = 0; idx < toolCallsOut.length; idx++) {
+			toolCallsOut[idx].index = idx;
+		}
 			if (toolCallsOut.length) message.tool_calls = toolCallsOut;
 
 			releaseChatLock();
