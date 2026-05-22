@@ -169,7 +169,8 @@ export function robustParseJSON(str: string): unknown {
 			}
 		}
 
-		if (bk > 0) aggFixed += "]".repeat(bk);
+		if (esc) aggFixed += "\\\\";
+	if (bk > 0) aggFixed += "]".repeat(bk);
 		if (ob > 0) aggFixed += "}".repeat(ob);
 
 		try {
