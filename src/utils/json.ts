@@ -81,7 +81,6 @@ export function robustParseJSON(str: string): unknown {
 		}
 
 		if (char === "\\") {
-			fixedJson += char;
 			escaped = true;
 			continue;
 		}
@@ -113,6 +112,7 @@ export function robustParseJSON(str: string): unknown {
 		}
 	}
 
+	if (escaped) fixedJson += "\\\\";
 	let tempJson = fixedJson;
 
 	// If we found a point where it was balanced and there is trailing noise or it didn't stay balanced

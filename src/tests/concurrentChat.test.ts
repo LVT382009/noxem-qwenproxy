@@ -32,9 +32,9 @@ test('Concurrent chat requests are serialized and both succeed', async () => {
 	const server = serve({ fetch: app.fetch, port });
 	console.log(`[ConcurrentTest] Server started on port ${port}`);
 
-	await initPlaywright(true);
-
 	try {
+		await initPlaywright(true);
+
 		const requestPayload = {
 			model: 'qwen3.6-plus',
 			messages: [{ role: 'user', content: 'Say "hello" and nothing else.' }],
