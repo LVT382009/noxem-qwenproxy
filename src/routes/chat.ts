@@ -42,14 +42,13 @@ export function getIncrementalDelta(oldStr: string, newStr: string): DeltaResult
 
 	// Heuristic to detect if newStr is cumulative or incremental:
 	// If newStr is cumulative, it should share a common prefix with oldStr.
-	const scanWindow = Math.min(2000, oldStr.length);
 	let commonPrefixLen = 0;
-	const maxLen = Math.min(scanWindow, newStr.length);
+	const maxLen = Math.min(oldStr.length, newStr.length);
 	while (commonPrefixLen < maxLen && oldStr[commonPrefixLen] === newStr[commonPrefixLen]) {
 		commonPrefixLen++;
 	}
 
-	const threshold = Math.min(scanWindow, 4);
+	const threshold = Math.min(oldStr.length, 4);
 	if (commonPrefixLen >= threshold) {
 		return {
 			delta: newStr.substring(commonPrefixLen),
@@ -266,8 +265,7 @@ export async function chatCompletions(c: Context) {
 						let foundStr = false;
 						let isThinkingChunk = false;
 
-						if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta &&
-				(targetResponseId === null || chunk.response_id === targetResponseId)) {
+						if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
 							const delta = chunk.choices[0].delta;
 
 							if (delta.phase === 'thinking_summary') {
@@ -411,10 +409,6 @@ export async function chatCompletions(c: Context) {
 				let buffer = '';
 				let completionTokens = 0;
 
-				// Cloudflare heartbeat: prevent 524 timeout during long thinking
-				let heartbeatInterval: NodeJS.Timeout | null = null;
-				let lastHeartbeatContent = '';
-
 				let promptTokens = Math.ceil(finalPrompt.length / 3.5);
 
 				while (true) {
@@ -454,8 +448,7 @@ export async function chatCompletions(c: Context) {
 							let foundStr = false;
 							let isThinkingChunk = false;
 
-							if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta &&
-				(targetResponseId === null || chunk.response_id === targetResponseId)) {
+							if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
 								const delta = chunk.choices[0].delta;
 
 								if (delta.phase === 'thinking_summary') {
@@ -487,15 +480,7 @@ export async function chatCompletions(c: Context) {
 
 								if (isThinkingChunk) {
 									inThinkingState = true;
-									reasoningBuffer += vStr;
-									if (!heartbeatInterval) {
-										heartbeatInterval = setInterval(() => {
-											if (lastFullContent !== lastHeartbeatContent) {
-												lastHeartbeatContent = lastFullContent;
-											}
-										}, 15000);
-									}
-									await writeEvent({
+									reasoningBuffer += vStr;									await writeEvent({
 										id: completionId,
 										object: 'chat.completion.chunk',
 										created: Math.floor(Date.now() / 1000),
@@ -612,12 +597,7 @@ export async function chatCompletions(c: Context) {
 					choices: [makeChoice({}, finalFinishReason)],
 					usage: usage
 				});
-				await streamWriter.write('data: [DONE]\n\n');
-							if (heartbeatInterval) {
-					clearInterval(heartbeatInterval);
-					heartbeatInterval = null;
-				}
-} finally {
+				await streamWriter.write('data: [DONE]\n\n');} finally {
 				releaseChatLock();
 			}
 		});
