@@ -7,6 +7,7 @@
 
 import { v4 as uuidv4 } from "uuid";
 import { getBasicHeaders, getQwenHeaders } from "./playwright.ts";
+import { type QwenFile } from "./file-upload.ts";
 
 interface GlobalWithSession {
 	_sessionStates?: Record<string, string | null>;
@@ -32,7 +33,7 @@ export interface QwenMessage {
 	role: "user" | "assistant";
 	content: string;
 	user_action: string;
-	files: unknown[];
+	files: QwenFile[];
 	timestamp: number;
 	models: string[];
 	chat_type: string;
@@ -182,6 +183,7 @@ export async function createQwenStream(
 	enableThinking: boolean,
 	modelId: string,
 	forcedParentId?: string | null,
+  files: QwenFile[] = [],
 ): Promise<{
 	stream: ReadableStream;
 	headers: Record<string, string>;
@@ -219,7 +221,7 @@ export async function createQwenStream(
 				role: "user",
 				content: prompt,
 				user_action: "chat",
-				files: [],
+				files: files,
 				timestamp: timestamp,
 				models: [model],
 				chat_type: "t2t",

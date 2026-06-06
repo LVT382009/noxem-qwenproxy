@@ -15,6 +15,7 @@ import { Hono } from "hono";
 import { bearerAuth } from "hono/bearer-auth";
 import { cors } from "hono/cors";
 import { chatCompletions } from "./routes/chat.ts";
+import { uploadFile } from "./routes/files.ts";
 import {
 	activePage,
 	type BrowserType,
@@ -57,6 +58,7 @@ app.get("/health", (c) => c.json({ status: "ok" }));
 
 // OpenAI compatible routes
 app.post("/v1/chat/completions", chatCompletions);
+app.post("/v1/files/upload", uploadFile);
 
 app.get("/v1/models", async (c) => {
 	try {

@@ -11,6 +11,7 @@
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
 import { v4 as uuidv4 } from 'uuid';
+import { getUploadedFiles } from "./files.ts";
 import { createQwenStream, updateSessionParent } from '../services/qwen.ts';
 import { OpenAIRequest, ChoiceDelta, Message } from '../utils/types.ts';
 import { registry } from '../tools/registry.ts';
@@ -180,7 +181,11 @@ export async function chatCompletions(c: Context) {
 		while (retries > 0) {
 			try {
 				// If it's a new session, force parent_message_id to null
-				const result = await createQwenStream(finalPrompt, isThinkingModel, body.model, isNewSession ? null : undefined);
+      // Resolve file_ids → QwenFile[] for attached documents
+      const bodyAny = body as any;
+      const fileIds: string[] = bodyAny.file_ids || [];
+      const resolvedFiles = fileIds.length > 0 ? getUploadedFiles(fileIds) : [];
+      const result = await createQwenStream(finalPrompt, isThinkingModel, body.model, isNewSession ? null : undefined, resolvedFiles);
 				stream = result.stream;
 				uiSessionId = result.uiSessionId;
 				break; // Success
