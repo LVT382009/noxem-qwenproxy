@@ -31,7 +31,9 @@ let cachedQwenHeaders: {
 	parentMessageId: string | null;
 } | null = null;
 let lastHeadersTime = 0;
-const HEADERS_TTL = 10 * 60 * 1000; // 10 minutes
+let refreshTimeout: NodeJS.Timeout | null = null;
+const HEADERS_TTL = 60 * 60 * 1000; // 60 minutes
+const REFRESH_THRESHOLD = 0.9; // Pre-refresh at 90% of TTL
 
 let uiLock: Promise<void> = Promise.resolve();
 
@@ -77,6 +79,10 @@ export async function initPlaywright(
 	browserType: BrowserType = "chromium",
 ) {
 	if (process.env.TEST_MOCK_PLAYWRIGHT) return;
+	if (refreshTimeout) {
+		clearTimeout(refreshTimeout);
+		refreshTimeout = null;
+	}
 	if (context) {
 		return;
 	}
@@ -325,6 +331,13 @@ async function _getQwenHeadersInternal(forceNew = false): Promise<{
 		cachedQwenHeaders &&
 		Date.now() - lastHeadersTime < HEADERS_TTL
 	) {
+		const age = Date.now() - lastHeadersTime;
+		if (age > HEADERS_TTL * REFRESH_THRESHOLD && !refreshTimeout) {
+			refreshTimeout = setTimeout(() => {
+				refreshTimeout = null;
+				getQwenHeaders(true).catch(() => {});
+			}, HEADERS_TTL - age);
+		}
 		return cachedQwenHeaders;
 	}
 
@@ -472,6 +485,10 @@ async function _fetchQwenHeaders(forceNew = false): Promise<{
 				parentMessageId: uiParentMessageId,
 			};
 			lastHeadersTime = Date.now();
+	if (refreshTimeout) {
+		clearTimeout(refreshTimeout);
+		refreshTimeout = null;
+	}
 
 			import("./qwen.ts").then((m) => m.disableNativeTools().catch(() => {}));
 

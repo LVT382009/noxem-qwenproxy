@@ -106,6 +106,7 @@ export async function disableNativeTools(): Promise<void> {
 				"bx-v": headers["bx-v"],
 			},
 			body: JSON.stringify(payload),
+		signal: (() => { const c = new AbortController(); setTimeout(() => c.abort(), 30000); return c.signal; })(),
 		},
 	);
 
@@ -273,6 +274,7 @@ export async function createQwenStream(
 			"bx-v": headers["bx-v"],
 		},
 		body: JSON.stringify(payload),
+		signal: (() => { const c = new AbortController(); setTimeout(() => c.abort(), 120000); return c.signal; })(),
 	});
 
 	if (!response.ok || !response.body) {

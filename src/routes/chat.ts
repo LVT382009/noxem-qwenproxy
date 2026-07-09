@@ -76,7 +76,7 @@ function parseQwenErrorPayload(raw: string): { message: string; status: number }
 			const code = payload.data?.code || payload.code || 'UpstreamError';
 			const details = payload.data?.details || payload.message || 'Qwen returned an error';
 			const wait = payload.data?.num !== undefined ? ` Wait about ${payload.data.num} hour(s) before trying again.` : '';
-			const status = code === 'RateLimited' ? 429 : 502;
+			const status = code === 'RateLimited' ? 429 : (code === 'Not_Found' ? 404 : 502);
 			return { message: `Qwen upstream error: ${code}: ${details}.${wait}`, status };
 		}
 		if (payload && payload.error) {
@@ -114,24 +114,44 @@ export async function chatCompletions(c: Context) {
 			}
 
 			if (msg.role === 'system') {
-				systemPrompt += contentStr + '\n\n';
+				systemPrompt += (contentStr || '') + '\n\n';
 			} else if (msg.role === 'user') {
-				prompt += `User: ${contentStr}\n\n`;
+				prompt += `User: ${contentStr || ''}\n\n`;
 			} else if (msg.role === 'assistant') {
-				let assistantContent = contentStr;
-				if ((msg as any).reasoning_content) {
-					assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
+				let assistantContent = contentStr || '';
+				const reasoning = (msg as any).reasoning_content;
+			if (reasoning) {
+					assistantContent = `<think>\n${reasoning}\n</think>\n${assistantContent}`;
 				}
 				if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
 					for (const tc of msg.tool_calls) {
-						let args = tc.function?.arguments || '{}';
-						if (typeof args !== 'string') args = JSON.stringify(args);
+						const args = tc.function?.arguments;
+				let parsedArgs: any = {};
+				if (typeof args === 'string') {
+					try { parsedArgs = JSON.parse(args); } catch { parsedArgs = {}; }
+				} else if (args && typeof args === 'object') {
+				parsedArgs = args;
+				}
 						assistantContent += `\nতত{"name": "${tc.function?.name}", "arguments": ${args}}✨`;
 					}
 				}
 				prompt += `Assistant: ${assistantContent.trim()}\n\n`;
 			} else if (msg.role === 'tool' || msg.role === 'function') {
-				prompt += `Tool Response (${msg.name || 'tool'}): ${contentStr}\n\n`;
+				let toolName = msg.name;
+			if (!toolName && msg.tool_call_id) {
+				for (let j = i - 1; j >= 0; j--) {
+					const prevMsg = messages[j];
+					if (prevMsg.role === 'assistant' && prevMsg.tool_calls) {
+						const call = prevMsg.tool_calls.find((tc: any) => tc.id === msg.tool_call_id);
+						if (call) {
+							toolName = call.function?.name;
+							break;
+						}
+					}
+				}
+			}
+			prompt += `Tool Response (${toolName || 'tool'}): ${contentStr || ''}`;
+
 			}
 		}
 
@@ -176,8 +196,8 @@ export async function chatCompletions(c: Context) {
 		// Retry logic with exponential backoff for "chat is in progress" errors
 		let stream: ReadableStream;
 		let uiSessionId = '';
-		let retries = 5;
-		let retryDelay = 1000;
+		let retries = 3;
+		let retryDelay = 500;
 		while (retries > 0) {
 			try {
 				// If it's a new session, force parent_message_id to null
@@ -191,16 +211,14 @@ export async function chatCompletions(c: Context) {
 				break; // Success
 			} catch (err: any) {
 				retries--;
-				const isInProgress = err.message?.includes('in progress') || err.message?.includes('Bad_Request');
-				if (retries === 0) {
+				const isRetryable = err.message?.includes('in progress') || err.message?.includes('Bad_Request') || err.message?.includes('timeout');
+				if (!isRetryable || retries === 0) {
 					releaseChatLock();
 					throw err;
 				}
-				console.warn(`[Chat] Qwen request failed (${isInProgress ? 'in progress' : 'other'}), retrying in ${retryDelay}ms... (${retries} left)`);
+				console.warn(`[Chat] Qwen request failed, retrying in ${retryDelay}ms... (${retries} left)`);
 				await new Promise(r => setTimeout(r, retryDelay));
-				if (isInProgress) {
-					retryDelay = Math.min(retryDelay * 2, 10000); // Exponential backoff, max 10s
-				}
+				retryDelay = Math.min(retryDelay * 2, 5000);
 			}
 		}
 
@@ -213,6 +231,7 @@ export async function chatCompletions(c: Context) {
 			let currentThoughtIndex = 0;
 			let reasoningBuffer = '';
 			let lastFullContent = '';
+			let targetResponseId: string | null = null;
 			const toolParser = new StreamingToolParser();
 			const toolCallsOut: any[] = [];
 			let buffer = '';
@@ -389,10 +408,12 @@ export async function chatCompletions(c: Context) {
 
 				let reasoningBuffer = '';
 				let lastFullContent = '';
+				let targetResponseId: string | null = null;
 				const toolParser = new StreamingToolParser();
 
 				let buffer = '';
 				let completionTokens = 0;
+
 				let promptTokens = Math.ceil(finalPrompt.length / 3.5);
 
 				while (true) {
@@ -464,8 +485,7 @@ export async function chatCompletions(c: Context) {
 
 								if (isThinkingChunk) {
 									inThinkingState = true;
-									reasoningBuffer += vStr;
-									await writeEvent({
+									reasoningBuffer += vStr;									await writeEvent({
 										id: completionId,
 										object: 'chat.completion.chunk',
 										created: Math.floor(Date.now() / 1000),
@@ -582,8 +602,7 @@ export async function chatCompletions(c: Context) {
 					choices: [makeChoice({}, finalFinishReason)],
 					usage: usage
 				});
-				await streamWriter.write('data: [DONE]\n\n');
-			} finally {
+				await streamWriter.write('data: [DONE]\n\n');} finally {
 				releaseChatLock();
 			}
 		});
